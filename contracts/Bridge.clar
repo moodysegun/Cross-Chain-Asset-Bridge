@@ -10,12 +10,22 @@
 (define-constant ERR_INVALID_SIGNATURE (err u106))
 (define-constant ERR_EXPIRED (err u107))
 (define-constant ERR_MINIMUM_AMOUNT (err u108))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u109))
+(define-constant ERR_PROPOSAL_EXPIRED (err u110))
+(define-constant ERR_PROPOSAL_NOT_EXECUTABLE (err u111))
+(define-constant ERR_ALREADY_VOTED (err u112))
+(define-constant ERR_INVALID_PROPOSAL_TYPE (err u113))
+(define-constant ERR_INSUFFICIENT_STAKE (err u114))
 
 (define-data-var contract-paused bool false)
 (define-data-var bridge-fee uint u1000000)
 (define-data-var minimum-bridge-amount uint u5000000)
 (define-data-var total-locked uint u0)
 (define-data-var total-transactions uint u0)
+(define-data-var governance-threshold uint u10000000)
+(define-data-var voting-period uint u1008)
+(define-data-var execution-delay uint u144)
+(define-data-var proposal-counter uint u0)
 
 (define-map locked-balances principal uint)
 (define-map processed-transactions (buff 32) bool)
@@ -30,6 +40,24 @@
 })
 
 (define-map user-nonces principal uint)
+
+(define-map governance-proposals uint {
+    proposer: principal,
+    proposal-type: uint,
+    target-value: uint,
+    target-chain: uint,
+    target-validator: principal,
+    start-height: uint,
+    end-height: uint,
+    execution-height: uint,
+    yes-votes: uint,
+    no-votes: uint,
+    executed: bool,
+    cancelled: bool
+})
+
+(define-map user-votes { proposal-id: uint, voter: principal } { vote: bool, power: uint })
+(define-map governance-stakes principal uint)
 
 (define-public (initialize)
     (begin
@@ -316,5 +344,229 @@
     (if (is-chain-supported target-chain-id)
         (ok u144)
         ERR_INVALID_CHAIN
+    )
+)
+
+(define-public (stake-for-governance (amount uint))
+    (let (
+        (current-stake (get-governance-stake tx-sender))
+    )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= (stx-get-balance tx-sender) amount) ERR_INSUFFICIENT_BALANCE)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set governance-stakes tx-sender (+ current-stake amount))
+        
+        (print { event: "governance-staked", user: tx-sender, amount: amount })
+        (ok amount)
+    )
+)
+
+(define-public (unstake-governance (amount uint))
+    (let (
+        (current-stake (get-governance-stake tx-sender))
+    )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= current-stake amount) ERR_INSUFFICIENT_BALANCE)
+        
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (map-set governance-stakes tx-sender (- current-stake amount))
+        
+        (print { event: "governance-unstaked", user: tx-sender, amount: amount })
+        (ok amount)
+    )
+)
+
+(define-public (create-proposal (proposal-type uint) (target-value uint) (target-chain uint) (target-validator principal))
+    (let (
+        (proposer-stake (get-governance-stake tx-sender))
+        (proposal-id (+ (var-get proposal-counter) u1))
+        (start-height stacks-block-height)
+        (end-height (+ start-height (var-get voting-period)))
+        (execution-height (+ end-height (var-get execution-delay)))
+    )
+        (asserts! (>= proposer-stake (var-get governance-threshold)) ERR_INSUFFICIENT_STAKE)
+        (asserts! (<= proposal-type u7) ERR_INVALID_PROPOSAL_TYPE)
+        
+        (var-set proposal-counter proposal-id)
+        (map-set governance-proposals proposal-id {
+            proposer: tx-sender,
+            proposal-type: proposal-type,
+            target-value: target-value,
+            target-chain: target-chain,
+            target-validator: target-validator,
+            start-height: start-height,
+            end-height: end-height,
+            execution-height: execution-height,
+            yes-votes: u0,
+            no-votes: u0,
+            executed: false,
+            cancelled: false
+        })
+        
+        (print {
+            event: "proposal-created",
+            proposal-id: proposal-id,
+            proposer: tx-sender,
+            proposal-type: proposal-type,
+            target-value: target-value
+        })
+        
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+    (let (
+        (proposal-data (unwrap! (map-get? governance-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (voter-stake (get-governance-stake tx-sender))
+        (current-height stacks-block-height)
+        (vote-key { proposal-id: proposal-id, voter: tx-sender })
+    )
+        (asserts! (> voter-stake u0) ERR_INSUFFICIENT_STAKE)
+        (asserts! (>= current-height (get start-height proposal-data)) ERR_EXPIRED)
+        (asserts! (<= current-height (get end-height proposal-data)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (is-none (map-get? user-votes vote-key)) ERR_ALREADY_VOTED)
+        (asserts! (not (get cancelled proposal-data)) ERR_PROPOSAL_EXPIRED)
+        
+        (map-set user-votes vote-key { vote: vote, power: voter-stake })
+        
+        (if vote
+            (map-set governance-proposals proposal-id 
+                (merge proposal-data { yes-votes: (+ (get yes-votes proposal-data) voter-stake) }))
+            (map-set governance-proposals proposal-id 
+                (merge proposal-data { no-votes: (+ (get no-votes proposal-data) voter-stake) }))
+        )
+        
+        (print {
+            event: "vote-cast",
+            proposal-id: proposal-id,
+            voter: tx-sender,
+            vote: vote,
+            power: voter-stake
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal-data (unwrap! (map-get? governance-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-height stacks-block-height)
+        (total-votes (+ (get yes-votes proposal-data) (get no-votes proposal-data)))
+        (proposal-type (get proposal-type proposal-data))
+        (target-value (get target-value proposal-data))
+        (target-chain (get target-chain proposal-data))
+        (target-validator (get target-validator proposal-data))
+    )
+        (asserts! (not (get executed proposal-data)) ERR_ALREADY_PROCESSED)
+        (asserts! (not (get cancelled proposal-data)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (>= current-height (get execution-height proposal-data)) ERR_EXPIRED)
+        (asserts! (> (get yes-votes proposal-data) (get no-votes proposal-data)) ERR_PROPOSAL_NOT_EXECUTABLE)
+        (asserts! (> total-votes u0) ERR_PROPOSAL_NOT_EXECUTABLE)
+        
+        (map-set governance-proposals proposal-id (merge proposal-data { executed: true }))
+        
+        (if (is-eq proposal-type u1)
+            (begin (var-set bridge-fee target-value) (print { event: "fee-updated-by-governance", new-fee: target-value }) true)
+            (if (is-eq proposal-type u2)
+                (begin (var-set minimum-bridge-amount target-value) (print { event: "minimum-updated-by-governance", new-minimum: target-value }) true)
+                (if (is-eq proposal-type u3)
+                    (begin (var-set contract-paused true) (print { event: "contract-paused-by-governance" }) true)
+                    (if (is-eq proposal-type u4)
+                        (begin (var-set contract-paused false) (print { event: "contract-unpaused-by-governance" }) true)
+                        (if (is-eq proposal-type u5)
+                            (begin 
+                                (map-set supported-chains target-chain true)
+                                (map-set chain-validators target-chain target-validator)
+                                (print { event: "chain-added-by-governance", chain-id: target-chain, validator: target-validator })
+                                true)
+                            (if (is-eq proposal-type u6)
+                                (begin
+                                    (map-delete supported-chains target-chain)
+                                    (map-delete chain-validators target-chain)
+                                    (print { event: "chain-removed-by-governance", chain-id: target-chain })
+                                    true)
+                                (if (is-eq proposal-type u7)
+                                    (begin (var-set governance-threshold target-value) (print { event: "governance-threshold-updated", new-threshold: target-value }) true)
+                                    false
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        
+        (print {
+            event: "proposal-executed",
+            proposal-id: proposal-id,
+            proposal-type: proposal-type,
+            executor: tx-sender
+        })
+        
+        (ok proposal-id)
+    )
+)
+
+(define-public (cancel-proposal (proposal-id uint))
+    (let (
+        (proposal-data (unwrap! (map-get? governance-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-height stacks-block-height)
+    )
+        (asserts! (or (is-eq tx-sender (get proposer proposal-data)) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+        (asserts! (not (get executed proposal-data)) ERR_ALREADY_PROCESSED)
+        (asserts! (not (get cancelled proposal-data)) ERR_ALREADY_PROCESSED)
+        (asserts! (<= current-height (get end-height proposal-data)) ERR_PROPOSAL_EXPIRED)
+        
+        (map-set governance-proposals proposal-id (merge proposal-data { cancelled: true }))
+        
+        (print {
+            event: "proposal-cancelled",
+            proposal-id: proposal-id,
+            canceller: tx-sender
+        })
+        
+        (ok proposal-id)
+    )
+)
+
+(define-read-only (get-governance-stake (user principal))
+    (default-to u0 (map-get? governance-stakes user))
+)
+
+(define-read-only (get-proposal-info (proposal-id uint))
+    (map-get? governance-proposals proposal-id)
+)
+
+(define-read-only (get-user-vote (proposal-id uint) (voter principal))
+    (map-get? user-votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-governance-settings)
+    {
+        threshold: (var-get governance-threshold),
+        voting-period: (var-get voting-period),
+        execution-delay: (var-get execution-delay),
+        total-proposals: (var-get proposal-counter)
+    }
+)
+
+(define-read-only (is-proposal-executable (proposal-id uint))
+    (match (map-get? governance-proposals proposal-id)
+        proposal-data (let (
+            (current-height stacks-block-height)
+            (total-votes (+ (get yes-votes proposal-data) (get no-votes proposal-data)))
+        )
+            (and
+                (not (get executed proposal-data))
+                (not (get cancelled proposal-data))
+                (>= current-height (get execution-height proposal-data))
+                (> (get yes-votes proposal-data) (get no-votes proposal-data))
+                (> total-votes u0)
+            )
+        )
+        false
     )
 )
