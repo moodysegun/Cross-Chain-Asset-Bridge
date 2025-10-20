@@ -16,6 +16,7 @@
 (define-constant ERR_ALREADY_VOTED (err u112))
 (define-constant ERR_INVALID_PROPOSAL_TYPE (err u113))
 (define-constant ERR_INSUFFICIENT_STAKE (err u114))
+(define-constant ERR_ACTIVITY_NOT_FOUND (err u115))
 
 (define-data-var contract-paused bool false)
 (define-data-var bridge-fee uint u1000000)
@@ -58,6 +59,13 @@
 
 (define-map user-votes { proposal-id: uint, voter: principal } { vote: bool, power: uint })
 (define-map governance-stakes principal uint)
+(define-map user-transaction-count principal uint)
+(define-map user-transactions { user: principal, tx-index: uint } { amount: uint, timestamp: uint, chain: uint })
+(define-map validator-activity principal { processed: uint, last-active: uint })
+(define-map daily-volume { date: uint } { total: uint, count: uint })
+(define-map top-transactions uint { user: principal, amount: uint, timestamp: uint })
+(define-data-var transaction-counter uint u0)
+(define-data-var top-tx-counter uint u0)
 
 (define-public (initialize)
     (begin
@@ -91,6 +99,26 @@
         (map-set processed-transactions tx-id true)
         (var-set total-locked (+ (var-get total-locked) amount))
         (var-set total-transactions (+ (var-get total-transactions) u1))
+        
+        (let (
+            (user-count (default-to u0 (map-get? user-transaction-count sender)))
+            (tx-index user-count)
+            (current-day (/ stacks-block-height u144))
+            (daily-data (default-to { total: u0, count: u0 } (map-get? daily-volume { date: current-day })))
+            (tx-counter (var-get transaction-counter))
+        )
+            (map-set user-transaction-count sender (+ user-count u1))
+            (map-set user-transactions { user: sender, tx-index: tx-index } { amount: amount, timestamp: stacks-block-height, chain: destination-chain })
+            (map-set daily-volume { date: current-day } { total: (+ (get total daily-data) amount), count: (+ (get count daily-data) u1) })
+            (if (> amount u100000)
+                (begin
+                    (map-set top-transactions tx-counter { user: sender, amount: amount, timestamp: stacks-block-height })
+                    (var-set top-tx-counter (+ tx-counter u1))
+                )
+                true
+            )
+            (var-set transaction-counter (+ tx-counter u1))
+        )
         
         (print {
             event: "asset-locked",
@@ -150,6 +178,12 @@
         (asserts! (not processed) ERR_ALREADY_PROCESSED)
         (asserts! (<= stacks-block-height expiry) ERR_EXPIRED)
         (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) ERR_INSUFFICIENT_BALANCE)
+        
+        (let (
+            (validator-stats (default-to { processed: u0, last-active: u0 } (map-get? validator-activity tx-sender)))
+        )
+            (map-set validator-activity tx-sender { processed: (+ (get processed validator-stats) u1), last-active: stacks-block-height })
+        )
         
         (try! (as-contract (stx-transfer? amount tx-sender recipient)))
         
@@ -569,4 +603,68 @@
         )
         false
     )
+)
+
+(define-read-only (get-user-transaction-count (user principal))
+    (ok (default-to u0 (map-get? user-transaction-count user)))
+)
+
+(define-read-only (get-user-transaction (user principal) (index uint))
+    (ok (map-get? user-transactions { user: user, tx-index: index }))
+)
+
+(define-read-only (get-user-recent-activity (user principal))
+    (let (
+        (count (default-to u0 (map-get? user-transaction-count user)))
+    )
+        (ok {
+            total-transactions: count,
+            last-tx-index: (if (> count u0) (- count u1) u0)
+        })
+    )
+)
+
+(define-read-only (get-daily-volume (date uint))
+    (ok (map-get? daily-volume { date: date }))
+)
+
+(define-read-only (get-current-day-volume)
+    (let (
+        (current-day (/ stacks-block-height u144))
+    )
+        (ok (map-get? daily-volume { date: current-day }))
+    )
+)
+
+(define-read-only (get-average-transaction-size (date uint))
+    (let (
+        (daily-data (map-get? daily-volume { date: date }))
+    )
+        (match daily-data
+            data (if (> (get count data) u0)
+                (ok (/ (get total data) (get count data)))
+                (ok u0)
+            )
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (get-total-transactions)
+    (ok (var-get transaction-counter))
+)
+
+(define-read-only (get-validator-activity (validator principal))
+    (ok (map-get? validator-activity validator))
+)
+
+(define-read-only (get-top-transaction (index uint))
+    (ok (map-get? top-transactions index))
+)
+
+(define-read-only (get-transaction-statistics)
+    (ok {
+        total-transactions: (var-get transaction-counter),
+        top-transactions-count: (var-get top-tx-counter)
+    })
 )
