@@ -17,6 +17,8 @@
 (define-constant ERR_INVALID_PROPOSAL_TYPE (err u113))
 (define-constant ERR_INSUFFICIENT_STAKE (err u114))
 (define-constant ERR_ACTIVITY_NOT_FOUND (err u115))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u116))
+(define-constant ERR_IN_COOLDOWN_PERIOD (err u117))
 
 (define-data-var contract-paused bool false)
 (define-data-var bridge-fee uint u1000000)
@@ -66,6 +68,52 @@
 (define-map top-transactions uint { user: principal, amount: uint, timestamp: uint })
 (define-data-var transaction-counter uint u0)
 (define-data-var top-tx-counter uint u0)
+(define-data-var max-daily-transactions uint u10)
+(define-data-var cooldown-period uint u144)
+(define-data-var rate-limit-window uint u144)
+(define-map user-transaction-counts { user: principal, day: uint } uint)
+(define-map user-cooldown-end principal uint)
+(define-map user-last-reset-block principal uint)
+
+(define-private (get-current-day)
+    (/ stacks-block-height (var-get rate-limit-window))
+)
+
+(define-private (reset-user-daily-count (user principal))
+    (let (
+        (last-reset (default-to u0 (map-get? user-last-reset-block user)))
+        (current-day (get-current-day))
+    )
+        (if (> current-day (/ last-reset (var-get rate-limit-window)))
+            (begin
+                (map-set user-transaction-counts { user: user, day: current-day } u0)
+                (map-set user-last-reset-block user stacks-block-height)
+            )
+            true
+        )
+    )
+)
+
+(define-private (check-and-update-rate-limit (user principal))
+    (let (
+        (cooldown-end (default-to u0 (map-get? user-cooldown-end user)))
+        (current-day (get-current-day))
+        (current-count (default-to u0 (map-get? user-transaction-counts { user: user, day: current-day })))
+        (max-daily (var-get max-daily-transactions))
+    )
+        (asserts! (<= stacks-block-height cooldown-end) true)
+        (if (>= current-count max-daily)
+            (begin
+                (map-set user-cooldown-end user (+ stacks-block-height (var-get cooldown-period)))
+                false
+            )
+            (begin
+                (map-set user-transaction-counts { user: user, day: current-day } (+ current-count u1))
+                true
+            )
+        )
+    )
+)
 
 (define-public (initialize)
     (begin
@@ -92,6 +140,8 @@
         (asserts! (>= current-balance total-amount) ERR_INSUFFICIENT_BALANCE)
         (asserts! (default-to true (map-get? supported-chains destination-chain)) ERR_INVALID_CHAIN)
         (asserts! (is-none (map-get? processed-transactions tx-id)) ERR_ALREADY_PROCESSED)
+        (reset-user-daily-count sender)
+        (asserts! (check-and-update-rate-limit sender) ERR_RATE_LIMIT_EXCEEDED)
         
         (try! (stx-transfer? total-amount sender (as-contract tx-sender)))
         
@@ -566,6 +616,40 @@
     )
 )
 
+(define-public (update-rate-limits (new-max-daily uint) (new-cooldown uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-max-daily u0) ERR_INVALID_AMOUNT)
+        (asserts! (> new-cooldown u0) ERR_INVALID_AMOUNT)
+        (var-set max-daily-transactions new-max-daily)
+        (var-set cooldown-period new-cooldown)
+        (print {
+            event: "rate-limits-updated",
+            max-daily-transactions: new-max-daily,
+            cooldown-period: new-cooldown
+        })
+        (ok true)
+    )
+)
+
+(define-public (emergency-reset-user-limits (user principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (let (
+            (current-day (get-current-day))
+        )
+            (map-delete user-cooldown-end user)
+            (map-delete user-transaction-counts { user: user, day: current-day })
+            (map-delete user-last-reset-block user)
+            (print {
+                event: "user-limits-reset",
+                user: user
+            })
+            (ok true)
+        )
+    )
+)
+
 (define-read-only (get-governance-stake (user principal))
     (default-to u0 (map-get? governance-stakes user))
 )
@@ -666,5 +750,41 @@
     (ok {
         total-transactions: (var-get transaction-counter),
         top-transactions-count: (var-get top-tx-counter)
+    })
+)
+
+(define-read-only (get-user-rate-limit-status (user principal))
+    (let (
+        (current-day (get-current-day))
+        (tx-count (default-to u0 (map-get? user-transaction-counts { user: user, day: current-day })))
+        (max-daily (var-get max-daily-transactions))
+        (cooldown-end (default-to u0 (map-get? user-cooldown-end user)))
+        (in-cooldown (> cooldown-end stacks-block-height))
+    )
+        (ok {
+            current-count: tx-count,
+            max-daily: max-daily,
+            remaining: (if (< tx-count max-daily) (- max-daily tx-count) u0),
+            in-cooldown: in-cooldown
+        })
+    )
+)
+
+(define-read-only (get-user-cooldown-remaining (user principal))
+    (let (
+        (cooldown-end (default-to u0 (map-get? user-cooldown-end user)))
+    )
+        (if (> cooldown-end stacks-block-height)
+            (ok (- cooldown-end stacks-block-height))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (get-rate-limit-config)
+    (ok {
+        max-daily-transactions: (var-get max-daily-transactions),
+        cooldown-period: (var-get cooldown-period),
+        rate-limit-window: (var-get rate-limit-window)
     })
 )
